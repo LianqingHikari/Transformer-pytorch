@@ -69,6 +69,7 @@ def load_and_clean_parallel_corpus(src_path, tgt_path):
             open(tgt_path, 'r', encoding='utf-8', errors='ignore') as tgt_f:
 
         for src_line, tgt_line in zip(src_f, tgt_f):
+            # 去除字符串首尾的空格
             src_line = src_line.strip()
             tgt_line = tgt_line.strip()
 
@@ -80,9 +81,9 @@ def load_and_clean_parallel_corpus(src_path, tgt_path):
             src_tokens = src_line.split()
             tgt_tokens = tgt_line.split()
             if len(src_tokens) > MAX_SEQ_LENGTH - 2 or len(tgt_tokens) > MAX_SEQ_LENGTH - 2:
-                continue  # 预留位置给特殊标记
+                continue  # 预留位置给特殊标记，起和止需要占用两个位置
 
-            # 过滤极端长度比例的句对
+            # 过滤极端长度比例的句对，认为这样的数据是不合理的，如，可能是标注错误。
             len_ratio = max(len(src_tokens) / len(tgt_tokens), len(tgt_tokens) / len(src_tokens))
             if len_ratio > MAX_LENGTH_RATIO:
                 continue
