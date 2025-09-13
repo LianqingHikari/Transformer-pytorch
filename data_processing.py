@@ -43,7 +43,7 @@ class WMTTranslationDataset(Dataset):
         return len(self.src_sentences)
 
     def __getitem__(self, idx):
-        """动态编码：取数时实时对原始句子分词编码（核心改动）"""
+        """动态编码：取数时实时对原始句子分词编码"""
         # 获取原始句子
         src_sent = self.src_sentences[idx]
         tgt_sent = self.tgt_sentences[idx]
@@ -178,6 +178,10 @@ def split_train_validation(src_train: list, tgt_train: list,
 
 
 def collate_fn(batch: list) -> dict:
+    """
+    :param batch: 待处理的批
+    :return: 填充后的批及其掩码
+    """
     """批处理函数（逻辑不变，仍按长度排序+填充，符合论文动态批处理策略）"""
     # 按源语言序列长度降序排序（优化填充效率，减少padding数量）
     batch.sort(key=lambda x: x['src_len'], reverse=True)
