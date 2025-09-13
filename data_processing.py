@@ -1,167 +1,157 @@
+# data_processing.py
+# 动态编码模式：取数时实时对原始句子编码，不提前缓存
 import os
 import torch
 import random
+from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.processors import TemplateProcessing
+# 从tokenizer.py导入分词器相关配置与函数
+from tokenizer import SPECIAL_TOKENS, train_bpe_tokenizer, load_bpe_tokenizer
 
-# 与论文完全一致的参数设置
-MAX_SEQ_LENGTH = 512  # 最大序列长度（论文中使用）
-VOCAB_SIZE = 30000  # BPE词汇表大小（论文明确指定30,000）
-MIN_SENTENCE_LENGTH = 1  # 最小句子长度（论文未过滤过短句子，仅过滤空句）
-MAX_LENGTH_RATIO = 2.0  # 长度比上限（论文中未严格限制，此处为合理值）
-VALIDATION_SPLIT_RATIO = 0.05  # 训练集拆分验证集的比例（仅当无newstest2013时使用）
+# -------------------------- 数据集核心配置（与论文一致） --------------------------
+MAX_SEQ_LENGTH = 512  # 最大序列长度（预留2个位置给<s>/</s>）
+MIN_SENTENCE_LENGTH = 1  # 最小句子长度（仅过滤空句）
+MAX_LENGTH_RATIO = 2.0  # 句对长度比上限（过滤不合理翻译）
+VALIDATION_SPLIT_RATIO = 0.05  # 训练集拆分验证集比例
 
 
 class WMTTranslationDataset(Dataset):
-    """适配WMT数据集格式的翻译数据集类（符合论文规范）"""
+    """适配WMT数据集格式的翻译数据集类（动态编码：取数时实时分词）"""
 
-    def __init__(self, src_sentences, tgt_sentences, src_tokenizer, tgt_tokenizer):
+    def __init__(self, src_sentences: list, tgt_sentences: list,
+                 src_tokenizer, tgt_tokenizer):
         """
         Args:
-            src_sentences: 源语言句子列表
-            tgt_sentences: 目标语言句子列表（与源语言严格对齐）
-            src_tokenizer: 源语言BPE分词器
-            tgt_tokenizer: 目标语言BPE分词器
+            src_sentences: 源语言原始句子列表（清洗后）
+            tgt_sentences: 目标语言原始句子列表（清洗后，与源语言严格对齐）
+            src_tokenizer: 源语言BPE分词器（来自tokenizer.py）
+            tgt_tokenizer: 目标语言BPE分词器（来自tokenizer.py）
         """
+        # 验证句对数量一致性（核心要求）
+        assert len(src_sentences) == len(tgt_sentences), \
+            "源语言和目标语言句子数量不匹配"
+
         self.src_sentences = src_sentences
         self.tgt_sentences = tgt_sentences
         self.src_tokenizer = src_tokenizer
         self.tgt_tokenizer = tgt_tokenizer
 
-        # 验证句对数量一致性（核心要求）
-        assert len(self.src_sentences) == len(self.tgt_sentences), \
-            "源语言和目标语言句子数量不匹配"
-
     def __len__(self):
+        """数据集总样本数"""
         return len(self.src_sentences)
 
     def __getitem__(self, idx):
-        """将句子转换为token ID序列，遵循论文中的序列格式"""
+        """动态编码：取数时实时对原始句子分词编码（核心改动）"""
+        # 获取原始句子
         src_sent = self.src_sentences[idx]
         tgt_sent = self.tgt_sentences[idx]
 
-        # 编码源语言（添加论文中使用的起始/结束标记）
+        # 实时编码源语言（分词器自动添加<s>和</s>，符合论文格式）
         src_encoded = self.src_tokenizer.encode(src_sent)
-        src_ids = src_encoded.ids
+        src_ids = torch.tensor(src_encoded.ids, dtype=torch.long)
 
-        # 编码目标语言（与论文一致，用于Teacher Forcing）
+        # 实时编码目标语言（用于Teacher Forcing，与论文一致）
         tgt_encoded = self.tgt_tokenizer.encode(tgt_sent)
-        tgt_ids = tgt_encoded.ids
+        tgt_ids = torch.tensor(tgt_encoded.ids, dtype=torch.long)
 
+        # 返回编码结果+序列长度（供collate_fn排序用）
         return {
-            'src': torch.tensor(src_ids, dtype=torch.long),
-            'tgt': torch.tensor(tgt_ids, dtype=torch.long),
+            'src': src_ids,
+            'tgt': tgt_ids,
             'src_len': len(src_ids),
             'tgt_len': len(tgt_ids)
         }
 
 
-def load_and_clean_parallel_corpus(src_path, tgt_path):
-    """加载并清洗平行语料（遵循论文数据预处理标准）"""
+def load_and_clean_parallel_corpus(src_path: str, tgt_path: str) -> tuple:
+    """加载并清洗平行语料（仅保留原始句子，不做编码，与论文预处理标准一致）"""
     src_sents = []
     tgt_sents = []
+
+    # 检查文件是否存在
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"源语言文件不存在：{src_path}")
+    if not os.path.exists(tgt_path):
+        raise FileNotFoundError(f"目标语言文件不存在：{tgt_path}")
+
+    # 计算源文件总行数（用于tqdm进度条）
+    def file_line_count(file_path):
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return sum(1 for _ in f)
+
+    total_lines = file_line_count(src_path)
 
     with open(src_path, 'r', encoding='utf-8', errors='ignore') as src_f, \
             open(tgt_path, 'r', encoding='utf-8', errors='ignore') as tgt_f:
 
-        for src_line, tgt_line in zip(src_f, tgt_f):
-            # 去除字符串首尾的空格
+        for line_idx, (src_line, tgt_line) in tqdm(enumerate(zip(src_f, tgt_f), 1), desc="平行语料清洗中...",total=total_lines):
             src_line = src_line.strip()
             tgt_line = tgt_line.strip()
 
-            # 过滤空句子（论文中唯一明确的过滤规则）
+            # 1. 过滤空句子（论文中唯一明确的过滤规则）
             if not src_line or not tgt_line:
                 continue
 
-            # 过滤过长序列（超过模型最大处理能力）
-            src_tokens = src_line.split()
-            tgt_tokens = tgt_line.split()
-            if len(src_tokens) > MAX_SEQ_LENGTH - 2 or len(tgt_tokens) > MAX_SEQ_LENGTH - 2:
-                continue  # 预留位置给特殊标记，起和止需要占用两个位置
+            # 2. 过滤超长序列（预留2个位置给<s>和</s>，避免编码后超出模型最大长度）
+            src_token_count = len(src_line.split())  # 按空格粗统计，避免提前分词
+            tgt_token_count = len(tgt_line.split())
+            if src_token_count > MAX_SEQ_LENGTH - 2 or tgt_token_count > MAX_SEQ_LENGTH - 2:
+                continue
 
-            # 过滤极端长度比例的句对，认为这样的数据是不合理的，如，可能是标注错误。
-            len_ratio = max(len(src_tokens) / len(tgt_tokens), len(tgt_tokens) / len(src_tokens))
+            # 3. 过滤极端长度比例的句对（避免标注错误数据）
+            len_ratio = max(src_token_count / tgt_token_count, tgt_token_count / src_token_count)
             if len_ratio > MAX_LENGTH_RATIO:
                 continue
 
+            # 直接保留原始句子（不编码）
             src_sents.append(src_line)
             tgt_sents.append(tgt_line)
 
+    print(f"平行语料清洗完成：共保留{len(src_sents)}个有效句对（仅原始句子，未编码）")
     return src_sents, tgt_sents
 
 
-def train_bpe_tokenizer(data_files, save_path, special_tokens=None):
-    """训练BPE分词器（严格复现论文中的子词分词方法）"""
-    if special_tokens is None:
-        special_tokens = ["<pad>", "<unk>", "<s>", "</s>"]  # 论文中使用的特殊标记
+def split_train_validation(src_train: list, tgt_train: list,
+                           split_ratio: float = VALIDATION_SPLIT_RATIO) -> tuple:
+    """从训练集拆分验证集（拆分原始句子列表，不涉及编码）"""
+    print(f"\n从训练集拆分验证集：拆分比例={split_ratio}")
+    # 绑定源-目标句对，避免拆分后错位
+    combined_pairs = list(zip(src_train, tgt_train))
+    # 固定种子确保可复现
+    random.seed(42)
+    random.shuffle(combined_pairs)
 
-    # 初始化BPE模型（与论文一致的子词分割算法）
-    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = Whitespace()  # 先按空格预处理
+    # 计算拆分索引
+    split_idx = int(len(combined_pairs) * (1 - split_ratio))
+    train_pairs = combined_pairs[:split_idx]
+    val_pairs = combined_pairs[split_idx:]
 
-    # 训练配置（严格匹配论文参数）
-    trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        special_tokens=special_tokens,
-        min_frequency=2  # 过滤低频组合，避免词汇表膨胀
-    )
+    # 还原为单独的原始句子列表
+    src_train_split, tgt_train_split = zip(*train_pairs)
+    src_val_split, tgt_val_split = zip(*val_pairs)
 
-    # 训练分词器
-    tokenizer.train(data_files, trainer)
-
-    # 设置后处理（自动添加<s>和</s>标记，符合论文序列格式）
-    tokenizer.post_processor = TemplateProcessing(
-        single="<s> $A </s>",
-        pair="<s> $A </s> $B:1 </s>:1",
-        special_tokens=[
-            ("<s>", tokenizer.token_to_id("<s>")),
-            ("</s>", tokenizer.token_to_id("</s>")),
-        ],
-    )
-
-    # 保存分词器
-    tokenizer.save(save_path)
-    return tokenizer
-
-
-def split_train_validation(src_train, tgt_train, split_ratio=VALIDATION_SPLIT_RATIO):
-    """从训练集中拆分验证集（仅当没有newstest2013时使用）"""
-    # 确保随机拆分时句对对齐
-    combined = list(zip(src_train, tgt_train))
-    random.shuffle(combined)
-
-    split_idx = int(len(combined) * (1 - split_ratio))
-    train_combined = combined[:split_idx]
-    val_combined = combined[split_idx:]
-
-    # 还原为源语言和目标语言列表
-    src_train_split, tgt_train_split = zip(*train_combined)
-    src_val_split, tgt_val_split = zip(*val_combined)
-
+    print(f"拆分完成：训练集{len(src_train_split)}句对，验证集{len(src_val_split)}句对")
     return list(src_train_split), list(tgt_train_split), list(src_val_split), list(tgt_val_split)
 
 
-def collate_fn(batch):
-    """批处理函数（实现论文中的动态批处理策略）"""
-    # 按长度排序以优化填充效率
+def collate_fn(batch: list) -> dict:
+    """批处理函数（逻辑不变，仍按长度排序+填充，符合论文动态批处理策略）"""
+    # 按源语言序列长度降序排序（优化填充效率，减少padding数量）
     batch.sort(key=lambda x: x['src_len'], reverse=True)
 
+    # 提取编码后的序列
     src_seqs = [item['src'] for item in batch]
     tgt_seqs = [item['tgt'] for item in batch]
 
-    # 填充至批次内最大长度（保持序列长度在前的格式，与论文一致）
+    # 填充至批次内最大长度（序列长度在前，批次在后，符合Transformer输入格式）
     src_padded = torch.nn.utils.rnn.pad_sequence(
-        src_seqs, batch_first=False, padding_value=0  # <pad>的ID为0
+        src_seqs, batch_first=False, padding_value=0  # <pad>的ID为0（分词器默认配置）
     )
     tgt_padded = torch.nn.utils.rnn.pad_sequence(
         tgt_seqs, batch_first=False, padding_value=0
     )
 
-    # 构建填充掩码（1表示有效token，0表示填充）
+    # 构建填充掩码（1=有效token，0=padding，用于注意力层屏蔽无效token）
     src_mask = (src_padded != 0).float()
     tgt_mask = (tgt_padded != 0).float()
 
@@ -173,77 +163,118 @@ def collate_fn(batch):
     }
 
 
-def get_wmt_dataloaders(data_dir, batch_size=32, use_predefined_val=True):
-    """获取符合论文标准的WMT数据集加载器"""
-    # 定义文件路径（遵循WMT数据集命名规范）
+def get_wmt_dataloaders(data_dir: str, batch_size: int = 32,
+                        use_predefined_val: bool = True) -> dict:
+    """
+    获取符合论文标准的WMT数据集加载器（动态编码模式：取数时实时分词）
+    """
+    # 1. 定义文件路径（遵循WMT数据集命名规范）
     file_paths = {
-        'train_src': os.path.join(data_dir, 'train.en'),
-        'train_tgt': os.path.join(data_dir, 'train.de'),
-        'test_src': os.path.join(data_dir, 'newstest2014.en'),
-        'test_tgt': os.path.join(data_dir, 'newstest2014.de'),
-        'val_src': os.path.join(data_dir, 'newstest2013.en'),  # 论文中使用的验证集
-        'val_tgt': os.path.join(data_dir, 'newstest2013.de')
+        'train_src': os.path.join(data_dir, 'train.en'),  # 英语训练集（原始文本）
+        'train_tgt': os.path.join(data_dir, 'train.de'),  # 德语训练集（原始文本）
+        'test_src': os.path.join(data_dir, 'newstest2014.en'),  # 英语测试集（原始文本）
+        'test_tgt': os.path.join(data_dir, 'newstest2014.de'),  # 德语测试集（原始文本）
+        'val_src': os.path.join(data_dir, 'newstest2013.en'),  # 英语验证集（原始文本）
+        'val_tgt': os.path.join(data_dir, 'newstest2013.de')  # 德语验证集（原始文本）
     }
 
-    # 创建必要的目录
-    os.makedirs(os.path.join(data_dir, 'tokenizers'), exist_ok=True)
-    src_tokenizer_path = os.path.join(data_dir, 'tokenizers', 'src_tokenizer.json')
-    tgt_tokenizer_path = os.path.join(data_dir, 'tokenizers', 'tgt_tokenizer.json')
+    # 2. 检查数据集目录是否存在
+    if not os.path.exists(data_dir):
+        raise NotADirectoryError(f"数据集目录不存在：{data_dir}")
 
-    # 1. 加载训练数据
-    print("加载并清洗训练数据...")
-    src_train, tgt_train = load_and_clean_parallel_corpus(
+    # 3. 加载/训练分词器（逻辑不变，仍从tokenizer.py调用，确保编码规则统一）
+    tokenizer_dir = os.path.join(data_dir, 'tokenizers')
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    src_tokenizer_path = os.path.join(tokenizer_dir, 'src_tokenizer_en.json')  # 英语分词器
+    tgt_tokenizer_path = os.path.join(tokenizer_dir, 'tgt_tokenizer_de.json')  # 德语分词器
+
+    ## 3.1 源语言（英语）分词器：优先加载，无则训练
+    try:
+        src_tokenizer = load_bpe_tokenizer(src_tokenizer_path)
+    except FileNotFoundError:
+        print("未找到英语分词器，开始训练...")
+        src_tokenizer = train_bpe_tokenizer(
+            data_files=[file_paths['train_src']],  # 用英语原始训练集训练
+            save_path=src_tokenizer_path
+        )
+
+    ## 3.2 目标语言（德语）分词器：优先加载，无则训练
+    try:
+        tgt_tokenizer = load_bpe_tokenizer(tgt_tokenizer_path)
+    except FileNotFoundError:
+        print("未找到德语分词器，开始训练...")
+        tgt_tokenizer = train_bpe_tokenizer(
+            data_files=[file_paths['train_tgt']],  # 用德语原始训练集训练
+            save_path=tgt_tokenizer_path
+        )
+
+    # 4. 处理训练集（加载原始文本→清洗→创建动态编码数据集）
+    print("\n" + "=" * 50)
+    print("开始处理训练集...")
+    # 4.1 加载并清洗原始训练集（仅保留原始句子）
+    src_train_raw, tgt_train_raw = load_and_clean_parallel_corpus(
         file_paths['train_src'], file_paths['train_tgt']
     )
+    # 4.2 创建动态编码数据集（传入原始句子+分词器，取数时实时编码）
+    train_dataset = WMTTranslationDataset(
+        src_sentences=src_train_raw,
+        tgt_sentences=tgt_train_raw,
+        src_tokenizer=src_tokenizer,
+        tgt_tokenizer=tgt_tokenizer
+    )
 
-    # 2. 处理验证集（严格遵循论文方法）
-    print("准备验证集...")
+    # 5. 处理验证集（优先newstest2013，无则从训练集拆分，均为原始句子）
+    print("\n" + "=" * 50)
+    print("开始处理验证集（动态编码模式）...")
     if use_predefined_val and os.path.exists(file_paths['val_src']) and os.path.exists(file_paths['val_tgt']):
-        # 优先使用newstest2013作为验证集（与论文完全一致）
-        src_val, tgt_val = load_and_clean_parallel_corpus(
+        # 5.1 使用预定义验证集（newstest2013，原始文本）
+        print("使用预定义验证集（newstest2013）...")
+        src_val_raw, tgt_val_raw = load_and_clean_parallel_corpus(
             file_paths['val_src'], file_paths['val_tgt']
         )
-        print(f"使用newstest2013作为验证集，共{len(src_val)}个句对")
     else:
-        # 若没有newstest2013，从训练集中拆分（论文的备选方案）
-        print("未找到newstest2013，从训练集中拆分验证集...")
-        src_train, tgt_train, src_val, tgt_val = split_train_validation(
-            src_train, tgt_train
+        # 5.2 从训练集拆分验证集（拆分原始句子列表）
+        print("未找到newstest2013，从训练集拆分验证集...")
+        src_train_raw, tgt_train_raw, src_val_raw, tgt_val_raw = split_train_validation(
+            src_train_raw, tgt_train_raw
         )
-        print(f"从训练集拆分验证集：训练集{len(src_train)}，验证集{len(src_val)}")
+        # 重新创建训练集（拆分后原始句子变化）
+        train_dataset = WMTTranslationDataset(
+            src_sentences=src_train_raw,
+            tgt_sentences=tgt_train_raw,
+            src_tokenizer=src_tokenizer,
+            tgt_tokenizer=tgt_tokenizer
+        )
 
-    # 3. 加载测试集（newstest2014，与论文一致）
-    print("加载测试集newstest2014...")
-    src_test, tgt_test = load_and_clean_parallel_corpus(
+    # 5.3 创建验证集（动态编码）
+    val_dataset = WMTTranslationDataset(
+        src_sentences=src_val_raw,
+        tgt_sentences=tgt_val_raw,
+        src_tokenizer=src_tokenizer,
+        tgt_tokenizer=tgt_tokenizer
+    )
+
+    # 6. 处理测试集（newstest2014，原始文本+动态编码）
+    print("\n" + "=" * 50)
+    print("开始处理测试集（动态编码模式）...")
+    # 6.1 加载并清洗原始测试集
+    src_test_raw, tgt_test_raw = load_and_clean_parallel_corpus(
         file_paths['test_src'], file_paths['test_tgt']
     )
-    print(f"测试集共{len(src_test)}个句对")
+    # 6.2 创建测试集（动态编码）
+    test_dataset = WMTTranslationDataset(
+        src_sentences=src_test_raw,
+        tgt_sentences=tgt_test_raw,
+        src_tokenizer=src_tokenizer,
+        tgt_tokenizer=tgt_tokenizer
+    )
 
-    # 4. 训练或加载BPE分词器
-    if not os.path.exists(src_tokenizer_path) or not os.path.exists(tgt_tokenizer_path):
-        print("训练BPE分词器（30,000词汇，与论文一致）...")
-        # 使用训练集数据训练分词器（论文方法）
-        src_tokenizer = train_bpe_tokenizer(
-            [file_paths['train_src']],
-            src_tokenizer_path
-        )
-        tgt_tokenizer = train_bpe_tokenizer(
-            [file_paths['train_tgt']],
-            tgt_tokenizer_path
-        )
-    else:
-        print("加载已训练的BPE分词器...")
-        src_tokenizer = Tokenizer.from_file(src_tokenizer_path)
-        tgt_tokenizer = Tokenizer.from_file(tgt_tokenizer_path)
-
-    # 5. 创建数据集和数据加载器
-    train_dataset = WMTTranslationDataset(src_train, tgt_train, src_tokenizer, tgt_tokenizer)
-    val_dataset = WMTTranslationDataset(src_val, tgt_val, src_tokenizer, tgt_tokenizer)
-    test_dataset = WMTTranslationDataset(src_test, tgt_test, src_tokenizer, tgt_tokenizer)
-
+    # 7. 创建数据加载器（逻辑不变，批处理仍按长度排序+填充）
+    print("\n" + "=" * 50)
+    print("开始创建数据加载器...")
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, collate_fn=collate_fn,
-        shuffle=True, num_workers=4, pin_memory=True
+        shuffle=True, num_workers=4, pin_memory=True  # pin_memory加速GPU数据传输
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, collate_fn=collate_fn,
@@ -254,6 +285,12 @@ def get_wmt_dataloaders(data_dir, batch_size=32, use_predefined_val=True):
         shuffle=False, num_workers=4, pin_memory=True
     )
 
+    print(f"数据加载器创建完成（动态编码模式）：")
+    print(f"- 训练集：{len(train_loader)}个批次（每批{batch_size}个句对，取数时实时编码）")
+    print(f"- 验证集：{len(val_loader)}个批次")
+    print(f"- 测试集：{len(test_loader)}个批次")
+
+    # 返回加载器和分词器（推理时需用分词器解码）
     return {
         'train': train_loader,
         'val': val_loader,
@@ -263,30 +300,43 @@ def get_wmt_dataloaders(data_dir, batch_size=32, use_predefined_val=True):
     }
 
 
-# 示例用法
+# 示例用法：验证动态编码流程
 if __name__ == "__main__":
-    # 数据集目录（替换为你的WMT数据集路径）
+    # 替换为你的WMT2014英德数据集目录（需包含train.en/train.de等原始文本文件）
     DATA_DIR = "./dataset/WMT2014EngGer"
 
-    # 获取数据加载器（严格遵循论文方法）
-    dataloaders = get_wmt_dataloaders(
-        data_dir=DATA_DIR,
-        batch_size=32,
-        use_predefined_val=True  # 使用newstest2013作为验证集（论文标准）
-    )
+    try:
+        # 获取动态编码模式的数据加载器
+        dataloaders = get_wmt_dataloaders(
+            data_dir=DATA_DIR,
+            batch_size=1,
+            use_predefined_val=True  # 优先使用newstest2013作为验证集
+        )
 
-    # 验证数据加载器
-    print("\n验证训练集批次...")
-    for batch in dataloaders['train']:
-        print(f"源语言序列形状: {batch['src'].shape}")  # (seq_len, batch_size)
-        print(f"目标语言序列形状: {batch['tgt'].shape}")
-        print(f"源语言掩码形状: {batch['src_mask'].shape}")
+        # 验证第一个训练批次（动态编码结果）
+        print("\n" + "=" * 50)
+        print("验证训练集批次（动态编码模式）：")
+        for batch in dataloaders['train']:
+            # 打印张量形状（与预编码模式一致，符合Transformer输入）
+            print(f"源语言序列形状: {batch['src'].shape} → (max_src_len, batch_size)")
+            print(f"目标语言序列形状: {batch['tgt'].shape} → (max_tgt_len, batch_size)")
+            print(f"源语言掩码形状: {batch['src_mask'].shape}（与源序列形状一致）")
 
-        # 解码示例（验证分词器正确性）
-        src_example = dataloaders['src_tokenizer'].decode(batch['src'][:, 0].numpy())
-        tgt_example = dataloaders['tgt_tokenizer'].decode(batch['tgt'][:, 0].numpy())
-        print(f"\n源语言示例: {src_example}")
-        print(f"目标语言示例: {tgt_example}")
-        break  # 只展示第一个批次
+            # 解码示例句子（验证动态编码正确性）
+            src_tokenizer = dataloaders['src_tokenizer']
+            tgt_tokenizer = dataloaders['tgt_tokenizer']
+            # 取第一个样本的ID解码为文本
+            src_sample_ids = batch['src'][:, 0].numpy()
+            tgt_sample_ids = batch['tgt'][:, 0].numpy()
+            src_sample_text = src_tokenizer.decode(src_sample_ids)
+            tgt_sample_text = tgt_tokenizer.decode(tgt_sample_ids)
 
-    print("\n数据处理完成，符合论文规范！")
+            print(f"\n第一个样本（源语言-英语）：{src_sample_text}")
+            print(f"第一个样本（目标语言-德语）：{tgt_sample_text}")
+            break  # 仅验证第一个批次
+
+        print("\n" + "=" * 50)
+        print("动态编码模式数据处理流程验证完成，符合论文规范！")
+
+    except Exception as e:
+        print(f"\n数据处理失败：{str(e)}")

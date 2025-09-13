@@ -12,7 +12,7 @@ from data_processing import get_wmt_dataloaders
 
 class TrainingConfig:
     def __init__(self):
-        self.batch_size = 32  # 单GPU批大小
+        self.batch_size = 1  # 单GPU批大小
         self.epochs = 30  # 总训练轮次
         self.gradient_accumulation = 8  # 梯度累积步数，总批大小=32*8=256
         self.resume_checkpoint = None  # 用于续训的检查点路径，如"checkpoints/epoch_5.pth"
