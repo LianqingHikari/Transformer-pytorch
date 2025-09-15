@@ -99,45 +99,7 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
     return total_loss / len(dataloader)
 
 
-def greedy_decode(model, src, max_len, start_symbol, end_symbol, device, pad_symbol: int = 0):
-    """贪婪解码（按样本处理EOS，已结束的样本后续强制填充EOS）"""
-    model.eval()
-    batch_size = src.size(1)
-
-    # 初始目标序列，仅<BOS>
-    tgt = torch.full((1, batch_size), start_symbol, dtype=src.dtype, device=device)
-
-    with torch.no_grad():
-        # 编码源序列（一次）
-        src_mask, _, _, src_pad_mask, _ = generate_mask(src, src)
-        enc_output, _ = model.encoder(src, src_mask, src_pad_mask)
-
-        # 跟踪每个样本是否已生成<EOS>
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        for _ in tqdm(range(max_len - 1)):
-            # 动态构造当前tgt所需掩码
-            _, tgt_mask, cross_mask, _, tgt_pad_mask = generate_mask(src, tgt)
-
-            # 解码并取最后一步预测
-            dec_output, _, _ = model.decoder(tgt, enc_output, tgt_mask, cross_mask, tgt_pad_mask, src_pad_mask)
-            logits = model.fc_out(dec_output)  # (tgt_len, batch, vocab)
-            next_token = logits[-1].argmax(dim=-1)  # (batch,)
-
-            # 已完成的样本强制输出<EOS>
-            next_token = torch.where(finished, torch.as_tensor(end_symbol, device=device, dtype=next_token.dtype), next_token)
-
-            # 追加到序列
-            tgt = torch.cat([tgt, next_token.unsqueeze(0)], dim=0)
-
-            # 更新完成标记
-            finished = finished | (next_token == end_symbol)
-
-            # 所有样本均完成则提前停止
-            if finished.all():
-                break
-
-    return tgt.transpose(0, 1)
+## decode逻辑已迁移至 model.Transformer.greedy_decode
 
 
 def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
@@ -166,8 +128,8 @@ def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
             total_loss += loss.item()
 
             # 自回归生成预测序列
-            predictions = greedy_decode(
-                model, src, MAX_SEQ_LENGTH, start_symbol, end_symbol, config.device
+            predictions = model.greedy_decode(
+                src, MAX_SEQ_LENGTH, start_symbol, end_symbol, config.device
             )
             all_predictions.extend(predictions.cpu().numpy())
             all_targets.extend(tgt_output.transpose(0, 1).cpu().numpy())
