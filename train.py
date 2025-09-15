@@ -290,8 +290,8 @@ def main():
     for epoch in range(start_epoch, config.epochs):
         # 训练当前epoch
         print(f'\n----- Epoch {epoch + 1}/{config.epochs} 训练开始 -----')
-        #train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch)
-        #train_losses.append(train_loss)
+        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch)
+        train_losses.append(train_loss)
 
         # 验证当前epoch
         print(f'\n----- Epoch {epoch + 1}/{config.epochs} 验证开始 -----')
