@@ -4,11 +4,11 @@ import torch.nn as nn
 import torch.optim as optim
 import time
 import matplotlib.pyplot as plt
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from torch.utils.tensorboard import SummaryWriter
 from model import Transformer,generate_mask
 from data_processing import get_wmt_dataloaders,MAX_SEQ_LENGTH
 from tqdm import tqdm
+from util import calculate_bleu_score, plot_training_curves
 
 class TrainingConfig:
     def __init__(self):
@@ -59,29 +59,7 @@ class LabelSmoothingLoss(nn.Module):
         return loss
 
 
-def calculate_bleu_score(predicted, target, tokenizer):
-    predictions = []
-    references = []
-
-    # 使用id_to_token逐id映射，避免字符串级解码导致按字符拆分
-    for pred, tgt in zip(predicted, target):
-        pred_ids = pred.tolist()
-        tgt_ids = tgt.tolist()
-
-        pred_tokens = [tokenizer.id_to_token(int(i)) for i in pred_ids]
-        tgt_tokens = [tokenizer.id_to_token(int(i)) for i in tgt_ids]
-
-        # 过滤特殊标记
-        specials = {'<pad>', '<s>', '</s>'}
-        pred_tokens = [tok for tok in pred_tokens if tok not in specials]
-        tgt_tokens = [tok for tok in tgt_tokens if tok not in specials]
-
-        predictions.append(pred_tokens)
-        references.append([tgt_tokens])
-
-    smoothie = SmoothingFunction().method4
-    bleu_score = corpus_bleu(references, predictions, smoothing_function=smoothie)
-    return bleu_score * 100
+## moved to util.calculate_bleu_score
 
 
 def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
@@ -341,23 +319,8 @@ def main():
     print(f'\n最终测试集结果: 损失: {test_loss:.4f}, BLEU分数: {test_bleu:.2f}')
 
     # 绘制训练曲线
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='训练损失')
-    plt.plot(val_losses, label='验证损失')
-    plt.xlabel('Epoch')
-    plt.ylabel('损失')
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(val_bleus, label='验证BLEU分数')
-    plt.xlabel('Epoch')
-    plt.ylabel('BLEU分数')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig('training_curves.png')
-    print("训练曲线已保存至 training_curves.png")
+    out_path = plot_training_curves(train_losses, val_losses, val_bleus, out_path='training_curves.png')
+    print(f"训练曲线已保存至 {out_path}")
 
     writer.close()
 
