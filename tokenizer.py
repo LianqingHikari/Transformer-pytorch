@@ -8,12 +8,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 
 # -------------------------- 分词器核心配置（与论文一致） --------------------------
-# 特殊标记：<pad>填充、<unk>未知词、<s>句子开始、</s>句子结束（论文标准）
-SPECIAL_TOKENS = ["<pad>", "<unk>", "<s>", "</s>"]
-# BPE词汇表大小（论文明确指定30,000）
-VOCAB_SIZE = 37000
-# 低频子词过滤阈值（避免词汇表膨胀，仅保留出现≥2次的子词组合）
-MIN_FREQUENCY = 2
+from config import SPECIAL_TOKENS, VOCAB_SIZE, MIN_FREQUENCY
 
 
 def train_bpe_tokenizer(data_files: list, save_path: str, special_tokens: list = SPECIAL_TOKENS) -> Tokenizer:

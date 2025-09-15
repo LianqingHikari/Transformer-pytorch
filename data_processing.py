@@ -7,6 +7,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 # 从tokenizer.py导入分词器相关配置与函数
 from tokenizer import SPECIAL_TOKENS, train_bpe_tokenizer, load_bpe_tokenizer
+from config import MAX_SEQ_LENGTH, MIN_SENTENCE_LENGTH, MAX_LENGTH_RATIO, VALIDATION_SPLIT_RATIO
 import hashlib
 import json
 

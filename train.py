@@ -3,38 +3,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import time
+import argparse
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from model import Transformer,generate_mask
-from data_processing import get_wmt_dataloaders,MAX_SEQ_LENGTH
+from data_processing import get_wmt_dataloaders
+import config as C
 from tqdm import tqdm
 from util import calculate_bleu_score, plot_training_curves
 
-class TrainingConfig:
-    def __init__(self):
-        self.batch_size = 16  # 单GPU批大小
-        self.epochs = 30  # 总训练轮次
-        self.gradient_accumulation = 8  # 梯度累积步数，总批大小=32*8=256
-        self.resume_checkpoint = None  # 用于续训的检查点路径，如"checkpoints/epoch_5.pth"
-        self.d_model = 512
-        self.num_heads = 8
-        self.num_encoder_layers = 6
-        self.num_decoder_layers = 6
-        self.d_ff = 2048
-        self.dropout = 0.1
-
-        # Adam参数
-        self.learning_rate = 5e-4
-        self.beta1 = 0.9
-        self.beta2 = 0.98
-        self.eps = 1e-9
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.log_dir = 'logs'
-        self.checkpoint_dir = 'checkpoints'
-        self.save_best_only = False  # 续训时建议保存所有epoch的检查点
-        self.clip_grad_norm = 5.0
-        self.label_smoothing = 0.1
+class _ArgsView:
+    pass
 
 
 class LabelSmoothingLoss(nn.Module):
@@ -145,8 +124,77 @@ def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
     return avg_loss, bleu_score
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Transformer Training')
+
+    # 数据/训练控制
+    parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--epochs', type=int)
+    parser.add_argument('--gradient_accumulation', type=int)
+    parser.add_argument('--resume_checkpoint', type=str)
+
+    # 模型结构
+    parser.add_argument('--d_model', type=int)
+    parser.add_argument('--num_heads', type=int)
+    parser.add_argument('--num_encoder_layers', type=int)
+    parser.add_argument('--num_decoder_layers', type=int)
+    parser.add_argument('--d_ff', type=int)
+    parser.add_argument('--dropout', type=float)
+
+    # 优化器
+    parser.add_argument('--learning_rate', type=float)
+    parser.add_argument('--beta1', type=float)
+    parser.add_argument('--beta2', type=float)
+    parser.add_argument('--eps', type=float)
+
+    # 杂项
+    parser.add_argument('--log_dir', type=str)
+    parser.add_argument('--checkpoint_dir', type=str)
+    parser.add_argument('--save_best_only', action='store_true')
+    parser.add_argument('--clip_grad_norm', type=float)
+    parser.add_argument('--label_smoothing', type=float)
+
+    # 数据目录
+    parser.add_argument('--data_dir', type=str, default='./dataset/WMT2014EngGer')
+
+    return parser.parse_args()
+
+
+def build_config_from_args(args: argparse.Namespace):
+    cfg = _ArgsView()
+    # defaults from config.py constants
+    cfg.batch_size = C.BATCH_SIZE
+    cfg.epochs = C.EPOCHS
+    cfg.gradient_accumulation = C.GRADIENT_ACCUMULATION
+    cfg.resume_checkpoint = C.RESUME_CHECKPOINT
+    cfg.d_model = C.D_MODEL
+    cfg.num_heads = C.NUM_HEADS
+    cfg.num_encoder_layers = C.NUM_ENCODER_LAYERS
+    cfg.num_decoder_layers = C.NUM_DECODER_LAYERS
+    cfg.d_ff = C.D_FF
+    cfg.dropout = C.DROPOUT
+    cfg.learning_rate = C.LEARNING_RATE
+    cfg.beta1 = C.BETA1
+    cfg.beta2 = C.BETA2
+    cfg.eps = C.EPS
+    cfg.device = C.DEVICE
+    cfg.log_dir = C.LOG_DIR
+    cfg.checkpoint_dir = C.CHECKPOINT_DIR
+    cfg.save_best_only = C.SAVE_BEST_ONLY
+    cfg.clip_grad_norm = C.CLIP_GRAD_NORM
+    cfg.label_smoothing = C.LABEL_SMOOTHING
+
+    # overrides from CLI when provided
+    for k, v in vars(args).items():
+        if v is None:
+            continue
+        setattr(cfg, k, v)
+    return cfg
+
+
 def main():
-    config = TrainingConfig()
+    args = parse_args()
+    config = build_config_from_args(args)
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     global writer
@@ -158,7 +206,7 @@ def main():
 
     # 加载数据
     dataloaders = get_wmt_dataloaders(
-        data_dir="./dataset/WMT2014EngGer",
+        data_dir=args.data_dir,
         batch_size=config.batch_size,
         use_predefined_val=True
     )
