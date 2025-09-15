@@ -6,13 +6,13 @@ import time
 import matplotlib.pyplot as plt
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from torch.utils.tensorboard import SummaryWriter
-from model import Transformer
-from data_processing import get_wmt_dataloaders
-
+from model import Transformer,generate_mask
+from data_processing import get_wmt_dataloaders,MAX_SEQ_LENGTH
+from tqdm import tqdm
 
 class TrainingConfig:
     def __init__(self):
-        self.batch_size = 1  # 单GPU批大小
+        self.batch_size = 16  # 单GPU批大小
         self.epochs = 30  # 总训练轮次
         self.gradient_accumulation = 8  # 梯度累积步数，总批大小=32*8=256
         self.resume_checkpoint = None  # 用于续训的检查点路径，如"checkpoints/epoch_5.pth"
@@ -63,14 +63,18 @@ def calculate_bleu_score(predicted, target, tokenizer):
     predictions = []
     references = []
 
+    # 使用id_to_token逐id映射，避免字符串级解码导致按字符拆分
     for pred, tgt in zip(predicted, target):
-        pred_tokens = tokenizer.decode(pred.tolist()).split()
-        if '</s>' in pred_tokens:
-            pred_tokens = pred_tokens[:pred_tokens.index('</s>')]
+        pred_ids = pred.tolist()
+        tgt_ids = tgt.tolist()
 
-        tgt_tokens = tokenizer.decode(tgt.tolist()).split()
-        if '</s>' in tgt_tokens:
-            tgt_tokens = tgt_tokens[:tgt_tokens.index('</s>')]
+        pred_tokens = [tokenizer.id_to_token(int(i)) for i in pred_ids]
+        tgt_tokens = [tokenizer.id_to_token(int(i)) for i in tgt_ids]
+
+        # 过滤特殊标记
+        specials = {'<pad>', '<s>', '</s>'}
+        pred_tokens = [tok for tok in pred_tokens if tok not in specials]
+        tgt_tokens = [tok for tok in tgt_tokens if tok not in specials]
 
         predictions.append(pred_tokens)
         references.append([tgt_tokens])
@@ -94,13 +98,15 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
 
         output, _, _, _ = model(src, tgt_input)
         loss = loss_fn(output, tgt_output) / config.gradient_accumulation
-        total_loss += loss.item() * config.gradient_accumulation
         loss.backward()
 
         if (batch_idx + 1) % config.gradient_accumulation == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
+
+        # 累计损失（注意：这里损失已经除以累积步数，所以直接累加）
+        total_loss += loss.item() * config.gradient_accumulation
 
         if (batch_idx + 1) % (50 * config.gradient_accumulation) == 0:
             avg_loss = total_loss / (batch_idx + 1)
@@ -115,6 +121,47 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
     return total_loss / len(dataloader)
 
 
+def greedy_decode(model, src, max_len, start_symbol, end_symbol, device, pad_symbol: int = 0):
+    """贪婪解码（按样本处理EOS，已结束的样本后续强制填充EOS）"""
+    model.eval()
+    batch_size = src.size(1)
+
+    # 初始目标序列，仅<BOS>
+    tgt = torch.full((1, batch_size), start_symbol, dtype=src.dtype, device=device)
+
+    with torch.no_grad():
+        # 编码源序列（一次）
+        src_mask, _, _, src_pad_mask, _ = generate_mask(src, src)
+        enc_output, _ = model.encoder(src, src_mask, src_pad_mask)
+
+        # 跟踪每个样本是否已生成<EOS>
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _ in tqdm(range(max_len - 1)):
+            # 动态构造当前tgt所需掩码
+            _, tgt_mask, cross_mask, _, tgt_pad_mask = generate_mask(src, tgt)
+
+            # 解码并取最后一步预测
+            dec_output, _, _ = model.decoder(tgt, enc_output, tgt_mask, cross_mask, tgt_pad_mask, src_pad_mask)
+            logits = model.fc_out(dec_output)  # (tgt_len, batch, vocab)
+            next_token = logits[-1].argmax(dim=-1)  # (batch,)
+
+            # 已完成的样本强制输出<EOS>
+            next_token = torch.where(finished, torch.as_tensor(end_symbol, device=device, dtype=next_token.dtype), next_token)
+
+            # 追加到序列
+            tgt = torch.cat([tgt, next_token.unsqueeze(0)], dim=0)
+
+            # 更新完成标记
+            finished = finished | (next_token == end_symbol)
+
+            # 所有样本均完成则提前停止
+            if finished.all():
+                break
+
+    return tgt.transpose(0, 1)
+
+
 def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
     model.eval()
     total_loss = 0.0
@@ -122,19 +169,29 @@ def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
     all_targets = []
     start_time = time.time()
 
+    # 获取开始和结束符号的ID
+    start_symbol = tgt_tokenizer.token_to_id("<s>")
+    end_symbol = tgt_tokenizer.token_to_id("</s>")
+
     with torch.no_grad():
-        for batch in dataloader:
+        pbar = tqdm(dataloader, desc=f"Validating Epoch {epoch + 1}", unit="batch")
+
+        for batch_idx, batch in enumerate(pbar):
             src = batch['src'].to(config.device)
             tgt = batch['tgt'].to(config.device)
             tgt_input = tgt[:-1, :]
             tgt_output = tgt[1:, :]
 
+            # 计算损失（仍使用教师强制，用于监控训练进度）
             output, _, _, _ = model(src, tgt_input)
             loss = loss_fn(output, tgt_output)
             total_loss += loss.item()
 
-            predictions = output.argmax(dim=-1)
-            all_predictions.extend(predictions.transpose(0, 1).cpu().numpy())
+            # 自回归生成预测序列
+            predictions = greedy_decode(
+                model, src, MAX_SEQ_LENGTH, start_symbol, end_symbol, config.device
+            )
+            all_predictions.extend(predictions.cpu().numpy())
             all_targets.extend(tgt_output.transpose(0, 1).cpu().numpy())
 
     avg_loss = total_loss / len(dataloader)
@@ -233,10 +290,11 @@ def main():
     for epoch in range(start_epoch, config.epochs):
         # 训练当前epoch
         print(f'\n----- Epoch {epoch + 1}/{config.epochs} 训练开始 -----')
-        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch)
-        train_losses.append(train_loss)
+        #train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch)
+        #train_losses.append(train_loss)
 
         # 验证当前epoch
+        print(f'\n----- Epoch {epoch + 1}/{config.epochs} 验证开始 -----')
         val_loss, val_bleu = validate(model, val_loader, loss_fn, tgt_tokenizer, config, epoch)
         val_losses.append(val_loss)
         val_bleus.append(val_bleu)
