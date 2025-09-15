@@ -11,7 +11,7 @@ from tokenizers.processors import TemplateProcessing
 # 特殊标记：<pad>填充、<unk>未知词、<s>句子开始、</s>句子结束（论文标准）
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<s>", "</s>"]
 # BPE词汇表大小（论文明确指定30,000）
-VOCAB_SIZE = 30000
+VOCAB_SIZE = 37000
 # 低频子词过滤阈值（避免词汇表膨胀，仅保留出现≥2次的子词组合）
 MIN_FREQUENCY = 2
 
