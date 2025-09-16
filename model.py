@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 from torch import Tensor
 from typing import Optional, Tuple, List
-
+from util import generate_mask
 
 class PositionalEncoding(nn.Module):
     """位置编码模块，为输入序列添加位置信息"""
@@ -28,28 +28,6 @@ class PositionalEncoding(nn.Module):
         """
         x = x + self.pe[:x.size(0)]
         return self.dropout(x)
-
-
-def generate_mask(src: Tensor, tgt: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """生成注意力掩码，用于屏蔽填充位置和未来信息"""
-    src_seq_len = src.size(0)
-    tgt_seq_len = tgt.size(0)
-
-    # 源序列自注意力掩码（全零，允许关注所有位置）
-    src_mask = torch.zeros(src_seq_len, src_seq_len).float().to(src.device)
-
-    # 目标序列自注意力掩码（防止关注未来的词）
-    tgt_mask = torch.triu(torch.ones(tgt_seq_len, tgt_seq_len) * float('-inf'), diagonal=1).to(tgt.device)
-
-    # 交叉注意力掩码（解码器->编码器），形状为(tgt_seq_len, src_seq_len)
-    # 全零表示允许解码器关注编码器的所有位置
-    cross_mask = torch.zeros(tgt_seq_len, src_seq_len).float().to(src.device)
-
-    # 填充掩码，假设0是填充符号
-    src_pad_mask = (src == 0).transpose(0, 1)  # 形状: (batch_size, src_seq_len)
-    tgt_pad_mask = (tgt == 0).transpose(0, 1)  # 形状: (batch_size, tgt_seq_len)
-
-    return src_mask, tgt_mask, cross_mask, src_pad_mask, tgt_pad_mask
 
 
 class MultiHeadAttention(nn.Module):
@@ -387,9 +365,11 @@ class Transformer(nn.Module):
             target_vocab_size=target_vocab_size,
             dropout=dropout
         )
+        self.decoder.embedding = self.encoder.embedding
 
         # 最终输出层
         self.fc_out = nn.Linear(d_model, target_vocab_size)
+        self.fc_out.weight = self.encoder.embedding.weight
 
     def forward(
             self,
@@ -469,12 +449,12 @@ class Transformer(nn.Module):
 # 示例用法
 if __name__ == "__main__":
     # 模型参数
-    input_vocab_size = 5000
-    target_vocab_size = 5000
+    input_vocab_size = 37000
+    target_vocab_size = 37000
     d_model = 512
     num_heads = 8
-    num_encoder_layers = 3
-    num_decoder_layers = 3
+    num_encoder_layers = 6
+    num_decoder_layers = 6
     d_ff = 2048
     dropout = 0.1
 
@@ -489,6 +469,13 @@ if __name__ == "__main__":
         target_vocab_size=target_vocab_size,
         dropout=dropout
     )
+
+
+    def count_parameters(model: nn.Module) -> int:
+        """计算模型的总参数量"""
+        return sum(p.numel() for p in model.parameters())
+
+    print(count_parameters(transformer))
 
     # 随机生成示例数据 (seq_len, batch_size)
     src_seq_len = 10
