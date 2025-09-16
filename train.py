@@ -4,13 +4,13 @@ import torch.nn as nn
 import torch.optim as optim
 import time
 import argparse
-import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
-from model import Transformer,generate_mask
+from model import Transformer, generate_mask
 from data_processing import get_wmt_dataloaders
 import config as C
 from tqdm import tqdm
-from util import calculate_bleu_score, plot_training_curves
+from util import calculate_bleu_score, plot_training_curves,count_parameters
+
 
 class _ArgsView:
     pass
@@ -78,9 +78,6 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
     return total_loss / len(dataloader)
 
 
-## decode逻辑已迁移至 model.Transformer.greedy_decode
-
-
 def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
     model.eval()
     total_loss = 0.0
@@ -108,7 +105,7 @@ def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
 
             # 自回归生成预测序列
             predictions = model.greedy_decode(
-                src, MAX_SEQ_LENGTH, start_symbol, end_symbol, config.device
+                src, C.MAX_SEQ_LENGTH, start_symbol, end_symbol, config.device
             )
             all_predictions.extend(predictions.cpu().numpy())
             all_targets.extend(tgt_output.transpose(0, 1).cpu().numpy())
@@ -230,6 +227,10 @@ def main():
         target_vocab_size=tgt_vocab_size,
         dropout=config.dropout
     ).to(config.device)
+
+    print("模型总参数量：")
+    print(count_parameters(model))
+
 
     loss_fn = LabelSmoothingLoss(
         vocab_size=tgt_vocab_size,
