@@ -41,7 +41,7 @@ class LabelSmoothingLoss(nn.Module):
 ## moved to util.calculate_bleu_score
 
 
-def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
+def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch, scheduler):
     model.train()
     total_loss = 0.0
     start_time = time.time()
@@ -61,6 +61,9 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
+            # Noam调度：每个等效大batch更新一次学习率
+            if scheduler is not None:
+                scheduler.step()
 
         # 累计损失（注意：这里损失已经除以累积步数，所以直接累加）
         total_loss += loss.item() * config.gradient_accumulation
@@ -74,6 +77,8 @@ def train_epoch(model, dataloader, loss_fn, optimizer, config, epoch):
 
             global_step = epoch * len(dataloader) + batch_idx
             writer.add_scalar('train/loss', avg_loss, global_step)
+            # 记录当前学习率
+            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
 
     return total_loss / len(dataloader)
 
@@ -112,6 +117,7 @@ def validate(model, dataloader, loss_fn, tgt_tokenizer, config, epoch):
 
     avg_loss = total_loss / len(dataloader)
     bleu_score = calculate_bleu_score(all_predictions, all_targets, tgt_tokenizer)
+
     val_time = time.time() - start_time
 
     print(f'\n===== Epoch {epoch + 1} 验证结果 =====')
@@ -153,6 +159,7 @@ def parse_args():
 
     # 数据目录
     parser.add_argument('--data_dir', type=str, default='./dataset/WMT2014EngGer')
+    #parser.add_argument('--data_dir', type=str, default='./dataset/WMT2014EngFre')
 
     return parser.parse_args()
 
@@ -240,10 +247,19 @@ def main():
 
     optimizer = optim.Adam(
         model.parameters(),
-        lr=config.learning_rate,
+        lr=1.0,  # 真实lr由Noam调度器产生
         betas=(config.beta1, config.beta2),
         eps=config.eps
     )
+
+    # 实现论文Noam调度：线性warmup到warmup_steps，再按step^{-0.5}衰减
+    def noam_lr_lambda(step: int):
+        step = max(1, step)
+        warmup = getattr(config, 'warmup_steps', 4000)
+        factor = getattr(config, 'noam_factor', 1.0)
+        return factor * (config.d_model ** -0.5) * min(step ** -0.5, step * (warmup ** -1.5))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=noam_lr_lambda)
 
     # 初始化训练状态
     start_epoch = 0
@@ -279,7 +295,7 @@ def main():
     for epoch in range(start_epoch, config.epochs):
         # 训练当前epoch
         print(f'\n----- Epoch {epoch + 1}/{config.epochs} 训练开始 -----')
-        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch)
+        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, config, epoch, scheduler)
         train_losses.append(train_loss)
 
         # 验证当前epoch
