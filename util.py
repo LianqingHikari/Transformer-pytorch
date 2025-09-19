@@ -5,50 +5,42 @@ import torch
 from typing import Tuple
 import torch.nn as nn
 
+
 def calculate_bleu_score(predicted, target, tokenizer):
-    """按token级别计算BLEU。
-
-    改进：
-    - 在首个 </s> 处截断预测与参考，避免EOS后的内容影响
-    - 过滤 <pad>/<s>/</s>
-    - 根据实际序列长度动态设置n-gram权重（长度<4时不被4-gram稀释）
-    - 空序列时用占位符兜底，避免BLEU报错
-    """
-    predictions = []
-    references = []
-
-    specials = {'<pad>', '<s>', '</s>'}
-
-    def ids_to_clean_tokens(id_list):
-        toks = [tokenizer.id_to_token(int(i)) for i in id_list]
-        if '</s>' in toks:
-            toks = toks[:toks.index('</s>')]
-        toks = [t for t in toks if t not in specials]
-        return toks if toks else ['<unk>']
+    specials = {'<pad>', '<s>', '</s>', '<unk>'}  # 扩展特殊标记
+    refs = []
+    hyps = []
 
     for pred, tgt in zip(predicted, target):
-        pred_ids = pred.tolist() if hasattr(pred, 'tolist') else list(pred)
-        tgt_ids = tgt.tolist() if hasattr(tgt, 'tolist') else list(tgt)
+        # 转换token ID到文本并过滤特殊标记
+        pred_tokens = [
+            tokenizer.id_to_token(int(i))
+            for i in (pred.tolist() if hasattr(pred, 'tolist') else pred)
+            if tokenizer.id_to_token(int(i)) not in specials
+        ]
+        tgt_tokens = [
+            tokenizer.id_to_token(int(i))
+            for i in (tgt.tolist() if hasattr(tgt, 'tolist') else tgt)
+            if tokenizer.id_to_token(int(i)) not in specials
+        ]
+        # 遇到</s>提前停止（如果存在）
+        try:
+            pred_tokens = pred_tokens[:pred_tokens.index('</s>')]
+        except ValueError:
+            pass
+        try:
+            tgt_tokens = tgt_tokens[:tgt_tokens.index('</s>')]
+        except ValueError:
+            pass
 
-        pred_tokens = ids_to_clean_tokens(pred_ids)
-        tgt_tokens = ids_to_clean_tokens(tgt_ids)
+        if tgt_tokens:  # 跳过空参考句
+            refs.append([tgt_tokens])
+            hyps.append(pred_tokens)
 
-        predictions.append(pred_tokens)
-        references.append([tgt_tokens])
-
-    # 动态n-gram权重：n = min(4, min_len)
-    if len(predictions) == 0:
-        return 0.0
-    # 估计有效长度（使用参考长度更稳定）
-    ref_lens = [len(ref[0]) for ref in references]
-    min_len = max(1, min(ref_lens))
-    n = min(4, min_len)
-    weights = tuple([1.0 / n] * n + [0.0] * (4 - n))
-
-    # 对极短句不做平滑，长度>=4时使用平滑以提升稳定性
-    smoothing = None if n < 4 else SmoothingFunction().method4
-    bleu_score = corpus_bleu(references, predictions, weights=weights, smoothing_function=smoothing)
-    return bleu_score * 100
+    # 语料库级BLEU计算（标准4-gram权重）
+    smoothing = SmoothingFunction().method1  # 常用平滑方法
+    score = corpus_bleu(refs, hyps, smoothing_function=smoothing)
+    return score * 100  # 转换为百分比形式
 
 
 def plot_training_curves(train_losses, val_losses, val_bleus, out_path: str = 'training_curves.png'):
